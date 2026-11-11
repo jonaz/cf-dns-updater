@@ -1,7 +1,7 @@
 [Unit]
-Description=Updates cloudflare DNS records with servers public IP
-Wants=network.target
-After=network.target
+Description=Updates cloudflare DNS records with the public IP
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -10,6 +10,12 @@ Group=cloudflare
 Restart=always
 RestartSec=10
 ExecStart=/usr/local/bin/cf-dns-updater -config /etc/cf-dns-updater.json
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target

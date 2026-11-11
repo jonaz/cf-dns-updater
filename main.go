@@ -1,155 +1,95 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
-	"fmt"
-	"log"
-	"net"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
-
-	cloudflare "github.com/cloudflare/cloudflare-go"
-	"github.com/sirupsen/logrus"
 )
 
-type Config struct {
-	APIKey   string   `json:"apiKey"`
-	APIEmail string   `json:"apiEmail"`
-	Interval string   `json:"interval"`
-	Domains  []string `json:"domains"`
-}
-
-var config *Config
-
-var logLevel = flag.String("log-level", "warning", "log level")
-var configLocation = flag.String("config", "config.json", "location of the config file")
+var (
+	logLevel       = flag.String("log-level", "warning", "log level (debug, info, warning, error)")
+	configLocation = flag.String("config", "config.json", "location of the config file")
+	once           = flag.Bool("once", false, "run one sync and exit")
+)
 
 func main() {
 	flag.Parse()
-	if lvl, err := logrus.ParseLevel(*logLevel); err == nil {
-		log.Println("Setting logrus level to:", lvl)
-		logrus.SetLevel(lvl)
-		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-	}
-	fmt.Println("Current IP is:", GetOutboundIP())
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(*logLevel)})))
+
 	config, err := loadConfig(*configLocation)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("loading config", "error", err)
+		os.Exit(1)
 	}
 
-	api, err := cloudflare.New(config.APIKey, config.APIEmail)
+	api, err := newAPI(config)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("setting up cloudflare client", "error", err)
+		os.Exit(1)
 	}
+	lookup := newIPLookup(config.IPURLs)
 
-	dur, err := time.ParseDuration(config.Interval)
-	if err != nil {
-		log.Fatal(err)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if *once {
+		if err := runSync(ctx, api, lookup, config.Domains); err != nil {
+			os.Exit(1)
+		}
 		return
 	}
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-
-	logrus.Info("Starting with sync interval: ", config.Interval)
-	ticker := time.NewTicker(dur)
-	sync(api, config.Domains)
+	slog.Info("starting", "interval", config.interval.String(), "domains", config.Domains)
+	ticker := time.NewTicker(config.interval)
+	defer ticker.Stop()
+	runSync(ctx, api, lookup, config.Domains)
 	for {
 		select {
 		case <-ticker.C:
-			sync(api, config.Domains)
-		case <-c:
-			ticker.Stop()
-			logrus.Info("Shutting down")
+			runSync(ctx, api, lookup, config.Domains)
+		case <-ctx.Done():
+			slog.Info("shutting down")
 			return
 		}
 	}
 }
 
-func sync(api *cloudflare.API, domains []string) {
-	ip := GetOutboundIP()
+// runSync looks up the public IP and points every domain's A record at it.
+// If the lookup fails, no record is touched.
+func runSync(ctx context.Context, api *api, lookup *ipLookup, domains []string) error {
+	ip, err := lookup.PublicIP(ctx)
+	if err != nil {
+		slog.Error("looking up public ip, leaving records unchanged", "error", err)
+		return err
+	}
+	slog.Debug("public ip", "ip", ip.String())
+
+	var firstErr error
 	for _, domain := range domains {
-		err := updateCloudFlare(api, domain, ip)
-		if err != nil {
-			logrus.Errorf("Error updating %s: %s", domain, err.Error())
+		if err := api.updateRecord(ctx, domain, ip); err != nil {
+			slog.Error("updating record", "domain", domain, "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
-func getBaseDomain(domain string) string {
-	tmp := strings.Split(domain, ".")
-	return tmp[len(tmp)-2] + "." + tmp[len(tmp)-1]
-}
-
-func updateCloudFlare(api *cloudflare.API, domain string, ip net.IP) error {
-	// Fetch the zone ID
-	id, err := api.ZoneIDByName(getBaseDomain(domain)) // Assuming example.com exists in your Cloudflare account already
-	if err != nil {
-		return err
+func parseLevel(s string) slog.Level {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelWarn
 	}
-	foo := cloudflare.DNSRecord{Name: domain, Type: "A"}
-	recs, err := api.DNSRecords(id, foo)
-	if err != nil {
-		return err
-	}
-
-	if len(recs) == 0 {
-		logrus.Debugf("Record %s not found. Creating!", domain)
-		//create the record
-		record := cloudflare.DNSRecord{
-			Name:    domain,
-			Type:    "A",
-			Content: ip.String(),
-			TTL:     1,
-			Proxied: false,
-		}
-		resp, err := api.CreateDNSRecord(id, record)
-		log.Printf("response: %#v", resp)
-		return err
-	}
-
-	for _, r := range recs {
-		if r.Content == ip.String() {
-			logrus.Debugf("Skipping update of %s since ip already is %s", r.Name, ip.String())
-			continue
-		}
-		fmt.Printf("Updating %s with ip: %s to ip:%s\n", r.Name, r.Content, ip.String())
-		r.Content = ip.String()
-		api.UpdateDNSRecord(id, r.ID, r)
-	}
-
-	return nil
-}
-
-func loadConfig(fn string) (*Config, error) {
-	file, err := os.Open(fn) // For read access.
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	decoder := json.NewDecoder(file)
-	config := &Config{}
-	err = decoder.Decode(config)
-	if config.Interval == "" {
-		logrus.Warning("interval config not set. Using default 10m")
-		config.Interval = "10m"
-	}
-	return config, err
-}
-
-// GetOutboundIP preferred outbound ip of this machine
-func GetOutboundIP() net.IP {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-
-	return localAddr.IP
 }
