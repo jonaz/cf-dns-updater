@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -26,7 +27,11 @@ type ipLookup struct {
 }
 
 func newIPLookup(urls []string) *ipLookup {
-	return &ipLookup{urls: urls, client: &http.Client{Timeout: 10 * time.Second}}
+	// Never use HTTP(S)_PROXY here: the services would report the proxy's
+	// address, which would then be published in every A record.
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return &ipLookup{urls: urls, client: &http.Client{Timeout: 10 * time.Second, Transport: t}}
 }
 
 // PublicIP returns the first valid public IPv4 address any URL reports.
@@ -85,16 +90,37 @@ func parseIP(s string) (net.IP, error) {
 	return ip, nil
 }
 
-var cgnat = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+// nonPublicV4 lists the IANA special-purpose IPv4 ranges that are not
+// globally reachable, plus multicast and reserved space.
+var nonPublicV4 = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),       // "this network"
+	netip.MustParsePrefix("10.0.0.0/8"),      // private
+	netip.MustParsePrefix("100.64.0.0/10"),   // CGNAT
+	netip.MustParsePrefix("127.0.0.0/8"),     // loopback
+	netip.MustParsePrefix("169.254.0.0/16"),  // link local
+	netip.MustParsePrefix("172.16.0.0/12"),   // private
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1
+	netip.MustParsePrefix("192.88.99.0/24"),  // deprecated 6to4 relay anycast
+	netip.MustParsePrefix("192.168.0.0/16"),  // private
+	netip.MustParsePrefix("198.18.0.0/15"),   // benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
+	netip.MustParsePrefix("224.0.0.0/4"),     // multicast
+	netip.MustParsePrefix("240.0.0.0/4"),     // reserved, includes broadcast
+}
 
 // checkPublicIPv4 refuses anything that must never end up in a public A record.
 func checkPublicIPv4(ip net.IP) error {
 	v4 := ip.To4()
-	switch {
-	case v4 == nil:
+	if v4 == nil {
 		return fmt.Errorf("%s is not IPv4", ip)
-	case !v4.IsGlobalUnicast(), v4.IsPrivate(), cgnat.Contains(v4):
-		return fmt.Errorf("%s is not a public address", ip)
+	}
+	addr := netip.AddrFrom4([4]byte(v4))
+	for _, p := range nonPublicV4 {
+		if p.Contains(addr) {
+			return fmt.Errorf("%s is not a public address (%s)", ip, p)
+		}
 	}
 	return nil
 }

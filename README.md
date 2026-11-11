@@ -3,9 +3,10 @@ Keeps Cloudflare A records pointed at the public IP of the network it runs in.
 
 The public IP is asked from outside (Cloudflare's `/cdn-cgi/trace`, then icanhazip), so it works
 on a host behind NAT or a port-forward, not only on a host with the public IP on an interface.
-An address that is private, CGNAT, loopback or link-local is refused, and no record is touched
-when no lookup succeeds. Running it on several hosts behind the same router is safe: they all
-write the same value.
+An address that is private, CGNAT, loopback, link-local or another special-use range (documentation,
+benchmarking, multicast, reserved) is refused, and no record is touched when no lookup succeeds.
+The lookups ignore `HTTPS_PROXY`, since a proxy would report its own address. Running it on
+several hosts behind the same router is safe: they all write the same value.
 
 It only changes a record's content, so TTL and proxied settings made in the dashboard are kept.
 A missing record is created (unproxied, auto TTL).

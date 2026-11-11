@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -41,8 +43,10 @@ func TestParseIPResponse(t *testing.T) {
 }
 
 func TestCheckPublicIPv4(t *testing.T) {
-	ok := []string{"92.32.18.68", "8.8.8.8"}
-	bad := []string{"192.168.13.3", "10.0.0.1", "172.16.5.5", "100.64.1.1", "127.0.0.1", "169.254.1.1", "0.0.0.0", "2001:db8::1"}
+	ok := []string{"92.32.18.68", "8.8.8.8", "1.1.1.1", "198.17.255.255", "198.20.0.1", "223.255.255.254"}
+	bad := []string{"192.168.13.3", "10.0.0.1", "172.16.5.5", "100.64.1.1", "127.0.0.1", "169.254.1.1", "0.0.0.0", "2001:db8::1",
+		"0.1.2.3", "192.0.0.8", "192.0.2.1", "192.88.99.1", "198.18.0.1", "198.19.255.255", "198.51.100.7", "203.0.113.9",
+		"224.0.0.1", "239.255.255.250", "240.0.0.1", "255.255.255.255"}
 	for _, s := range ok {
 		if err := checkPublicIPv4(net.ParseIP(s)); err != nil {
 			t.Errorf("%s: unexpected error %v", s, err)
@@ -78,10 +82,18 @@ func TestPublicIPFallsBack(t *testing.T) {
 	}
 }
 
+func TestIPLookupIgnoresProxy(t *testing.T) {
+	tr, ok := newIPLookup(nil).client.Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatal("ip lookup must not go through HTTP(S)_PROXY")
+	}
+}
+
 // fakeCloudflare serves just enough of the v4 API for updateRecord.
 type fakeCloudflare struct {
 	mu      sync.Mutex
 	records map[string]*dnsRecord // by id
+	perPage int                   // page size for record listings, 0 means all at once
 	calls   []string
 	auth    []string
 }
@@ -109,7 +121,17 @@ func (f *fakeCloudflare) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				out = append(out, *rec)
 			}
 		}
-		reply(out)
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		size := f.perPage
+		if size == 0 {
+			size = max(len(out), 1)
+		}
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		page = max(page, 1)
+		pages := max((len(out)+size-1)/size, 1)
+		lo, hi := min((page-1)*size, len(out)), min(page*size, len(out))
+		b, _ := json.Marshal(out[lo:hi])
+		json.NewEncoder(w).Encode(apiResponse{Success: true, Result: b, Info: &resultInfo{Page: page, TotalPages: pages}})
 	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/zones/zone1/dns_records/"):
 		var in dnsRecord
 		json.NewDecoder(r.Body).Decode(&in)
@@ -178,6 +200,22 @@ func TestUpdateRecord(t *testing.T) {
 	}
 	if f.auth[0] != "Bearer tok|" {
 		t.Errorf("token auth header: %q", f.auth[0])
+	}
+}
+
+func TestUpdateRecordFollowsPages(t *testing.T) {
+	f := &fakeCloudflare{perPage: 2, records: map[string]*dnsRecord{}}
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		f.records[id] = &dnsRecord{ID: id, Type: "A", Name: "nergy.se", Content: "92.32.18.68"}
+	}
+	a := newTestAPI(t, f, &Config{APIToken: "tok"})
+	if err := a.updateRecord(context.Background(), "nergy.se", net.ParseIP("92.32.22.177")); err != nil {
+		t.Fatal(err)
+	}
+	for id, rec := range f.records {
+		if rec.Content != "92.32.22.177" {
+			t.Errorf("record %s on a later page was not updated: %s", id, rec.Content)
+		}
 	}
 }
 

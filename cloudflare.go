@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,12 @@ type apiResponse struct {
 	Success bool            `json:"success"`
 	Errors  []apiError      `json:"errors"`
 	Result  json.RawMessage `json:"result"`
+	Info    *resultInfo     `json:"result_info"`
+}
+
+type resultInfo struct {
+	Page       int `json:"page"`
+	TotalPages int `json:"total_pages"`
 }
 
 type apiError struct {
@@ -66,9 +73,8 @@ func (a *api) updateRecord(ctx context.Context, domain string, ip net.IP) error 
 		return err
 	}
 
-	var recs []dnsRecord
-	q := url.Values{"type": {"A"}, "name": {domain}}
-	if err := a.do(ctx, http.MethodGet, "/zones/"+zoneID+"/dns_records?"+q.Encode(), nil, &recs); err != nil {
+	recs, err := a.listRecords(ctx, zoneID, domain)
+	if err != nil {
 		return fmt.Errorf("listing records: %w", err)
 	}
 
@@ -90,6 +96,23 @@ func (a *api) updateRecord(ctx context.Context, domain string, ip net.IP) error 
 		}
 	}
 	return nil
+}
+
+// listRecords returns every A record named domain, following pagination.
+func (a *api) listRecords(ctx context.Context, zoneID, domain string) ([]dnsRecord, error) {
+	var all []dnsRecord
+	for page := 1; ; page++ {
+		q := url.Values{"type": {"A"}, "name": {domain}, "page": {strconv.Itoa(page)}, "per_page": {"100"}}
+		var recs []dnsRecord
+		r, err := a.request(ctx, http.MethodGet, "/zones/"+zoneID+"/dns_records?"+q.Encode(), nil, &recs)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, recs...)
+		if r.Info == nil || page >= r.Info.TotalPages || len(recs) == 0 {
+			return all, nil
+		}
+	}
 }
 
 func (a *api) zoneID(ctx context.Context, zone string) (string, error) {
@@ -117,17 +140,22 @@ func (a *api) zoneID(ctx context.Context, zone string) (string, error) {
 }
 
 func (a *api) do(ctx context.Context, method, path string, in, out any) error {
+	_, err := a.request(ctx, method, path, in, out)
+	return err
+}
+
+func (a *api) request(ctx context.Context, method, path string, in, out any) (*apiResponse, error) {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, a.baseURL+path, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if a.token != "" {
@@ -139,25 +167,27 @@ func (a *api) do(ctx context.Context, method, path string, in, out any) error {
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var r apiResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(&r); err != nil {
-		return fmt.Errorf("%s: decoding response: %w", resp.Status, err)
+		return nil, fmt.Errorf("%s: decoding response: %w", resp.Status, err)
 	}
 	if !r.Success || resp.StatusCode >= 300 {
 		msgs := make([]string, 0, len(r.Errors))
 		for _, e := range r.Errors {
 			msgs = append(msgs, fmt.Sprintf("%d: %s", e.Code, e.Message))
 		}
-		return fmt.Errorf("%s: %s", resp.Status, strings.Join(msgs, "; "))
+		return nil, fmt.Errorf("%s: %s", resp.Status, strings.Join(msgs, "; "))
 	}
 	if out != nil {
-		return json.Unmarshal(r.Result, out)
+		if err := json.Unmarshal(r.Result, out); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return &r, nil
 }
 
 func getBaseDomain(domain string) string {
