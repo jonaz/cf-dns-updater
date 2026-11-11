@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,7 +12,11 @@ import (
 	"time"
 )
 
+// version is set by the release build (-ldflags "-X main.version=...").
+var version = "dev"
+
 var (
+	showVersion    = flag.Bool("version", false, "print the version and exit")
 	logLevel       = flag.String("log-level", "warning", "log level (debug, info, warning, error)")
 	configLocation = flag.String("config", "config.json", "location of the config file")
 	once           = flag.Bool("once", false, "run one sync and exit")
@@ -19,6 +24,10 @@ var (
 
 func main() {
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(*logLevel)})))
 
 	config, err := loadConfig(*configLocation)
@@ -44,7 +53,7 @@ func main() {
 		return
 	}
 
-	slog.Info("starting", "interval", config.interval.String(), "domains", config.Domains)
+	slog.Info("starting", "version", version, "interval", config.interval.String(), "domains", config.Domains)
 	ticker := time.NewTicker(config.interval)
 	defer ticker.Stop()
 	runSync(ctx, api, lookup, config.Domains)

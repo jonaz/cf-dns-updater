@@ -12,6 +12,11 @@ A missing record is created (unproxied, auto TTL).
 
 ### Installation
 
+Download `cf-dns-updater-linux-amd64` (or `-arm64`) and `SHA256SUMS` from the
+[latest release](https://github.com/jonaz/cf-dns-updater/releases/latest), check it with
+`sha256sum -c --ignore-missing SHA256SUMS`, and install it as `/usr/local/bin/cf-dns-updater`.
+Or build it yourself:
+
 ```
 go install github.com/jonaz/cf-dns-updater@latest
 sudo mv $(go env GOPATH)/bin/cf-dns-updater /usr/local/bin
@@ -35,6 +40,8 @@ Usage of cf-dns-updater:
     	log level (debug, info, warning, error) (default "warning")
   -once
     	run one sync and exit
+  -version
+    	print the version and exit
 ```
 
 Updates are logged at warning, so the default level shows every change.
